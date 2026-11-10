@@ -121,3 +121,9 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        with:
+          # The site is ~92 MB (the wasm is ~90 of it). Pages needs longer than the
+          # action's 10-minute default to sync that much (the first deploy timed out
+          # in "syncing_files" and was cancelled). 30 minutes is far past any observed
+          # sync time; the job-level timeout-minutes is the real backstop.
+          timeout: 1800000
