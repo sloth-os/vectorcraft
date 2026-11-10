@@ -1,0 +1,119 @@
+# Weekly WASM build of VectorCraft for the web, published to GitHub Pages.
+#
+# The wasm comes from storytold/vectorcraft@main (upstream); the app is a Trunk site
+# (apps/vectorcraft-web) whose artifacts are content-hashed, so the whole site can be
+# precached by a service worker and then works offline.
+#
+# Pages must be enabled on the repo with "GitHub Actions" as the source (Settings › Pages).
+name: Publish WASM to Pages
+
+on:
+  schedule:
+    # Weekly, Mondays 03:07 UTC (an off-minute, so the run doesn't land in GitHub's top-of-hour
+    # API stampede). Scheduled runs fire only from the default branch.
+    - cron: "7 3 * * 1"
+  workflow_dispatch: # manual "Run workflow" button
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/pages.yml
+      - scripts/pwa.mjs
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; a queued run replaces an older queued one, never a running one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same wasm32 flags the app repo's own .cargo/config.toml sets (#2786, ~2.4x faster canvas),
+  # restated here so the build keeps them even if that file stops applying (e.g. a cargo
+  # config search-path change). A build without them still works, only slower.
+  CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: -C target-feature=+simd128
+
+jobs:
+  publish:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout this repo (the PWA script)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout app (storytold/vectorcraft)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/vectorcraft
+          # Weekly releases should track upstream main, not this repo's pins.
+          ref: main
+          # A shallow clone is enough to build and keeps the checkout fast.
+          fetch-depth: 1
+          path: app
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install Trunk
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
+        with:
+          # Pinned tool versions: a weekly rebuild on a moving toolchain is the classic way
+          # an otherwise green build silently breaks months later. Local build verified
+          # with 0.22.1.
+          version: v0.22.1
+
+      - name: Fetch craft-fonts (Arabic, Thai and Georgian web fonts)
+        run: |
+          set -euo pipefail
+          # The Trunk post_build hook (`cargo xtask web-fonts`) copies the faces listed in
+          # crates/text/web-fonts.txt from this checkout into the site's fonts/ folder,
+          # keyed by SHA-256. Without it the app still builds; Arabic (and Thai, Georgian)
+          # text just shows as boxes.
+          #
+          # The rev is upstream's own pin (.github/workflows/release.yml › craft-fonts-ref).
+          # The three `startup` faces exist at that rev; the `background` Arabic display
+          # families the list also names were never in this manifest, so they are skipped
+          # with a warning in the build log — harmless (they are optional menu fonts).
+          git clone --no-checkout --filter=blob:none https://github.com/storytold/craft-fonts.git "$RUNNER_TEMP/craft-fonts"
+          git -C "$RUNNER_TEMP/craft-fonts" checkout b076417b5880bd4154bd22f00695b1d28c6bea83
+          echo "CRAFT_FONTS_DIR=$RUNNER_TEMP/craft-fonts" >> "$GITHUB_ENV"
+
+      - name: Build the Trunk site (release)
+        working-directory: app/apps/vectorcraft-web
+        run: trunk build --release
+
+      - name: Add PWA support (manifest, icons, service worker)
+        run: |
+          set -euo pipefail
+          # Move the dist out of the app tree, so it's obvious the workflow publishes
+          # exactly what the build made, and drop the 1024px icon master in for the
+          # manifest icons (the site itself ships only 32 and 256px).
+          rm -rf "$RUNNER_TEMP/dist"
+          mv app/dist/web "$RUNNER_TEMP/dist"
+          cp app/assets/app-icon/vectorcraft-1024.png "$RUNNER_TEMP/dist/icons/vectorcraft-1024.png"
+          node scripts/pwa.mjs "$RUNNER_TEMP/dist"
+          # The dist is rebuilt weekly, but files keep the same name only when their
+          # content changed. Print the site inventory for the build log.
+          du -sh "$RUNNER_TEMP/dist"; find "$RUNNER_TEMP/dist" -type f | wc -l
+
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        with:
+          path: ${{ runner.temp }}/dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

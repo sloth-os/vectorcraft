@@ -1,0 +1,4 @@
+# Nothing builds in this repo (the workflow builds the app repo), but keep build
+# droppings from local tests out of git.
+dist/
+node_modules/
