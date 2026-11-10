@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # list this run's artifacts to deploy (the artifact-id lookup below)
   pages: write
   id-token: write
 
@@ -40,7 +41,10 @@ jobs:
   publish:
     name: Build and deploy
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Build ~30 min (cold, full Rust release build) + Pages sync of a 37.6 MB artifact
+    # (observed >10 min in "syncing_files") + slack. The deploy step itself gives up
+    # polling at 40 min without cancelling the sync.
+    timeout-minutes: 75
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -114,16 +118,98 @@ jobs:
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
       - name: Upload artifact
+        id: artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
         with:
           path: ${{ runner.temp }}/dist
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
-        with:
-          # The site is ~92 MB (the wasm is ~90 of it). Pages needs longer than the
-          # action's 10-minute default to sync that much (the first deploy timed out
-          # in "syncing_files" and was cancelled). 30 minutes is far past any observed
-          # sync time; the job-level timeout-minutes is the real backstop.
-          timeout: 1800000
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Same request shape as actions/deploy-pages (its create/status/cancel calls,
+          # minus its 10-minute hard cap and its cancel-on-timeout): artifact id + build
+          # SHA + the job's OIDC token, which Pages verifies server-side. The OIDC token
+          # comes from the runtime's own $ACTIONS_ID_TOKEN_REQUEST_URL below.
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          sha="${GITHUB_SHA}"
+
+          # The OIDC token the deploy API needs; requested for the default audience.
+          echo "Requesting OIDC token…"
+          tok=$(curl -sS --fail-with-body -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Accept: application/json; api-version=2.0" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r '.value')
+          if [ -z "$tok" ] || [ "$tok" = "null" ]; then
+            echo "::error::OIDC token request failed"; exit 1
+          fi
+          echo "OIDC token acquired (${#tok} chars)"
+
+          # The artifact id for this run's "github-pages" artifact.
+          art_id=$(gh api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name == "github-pages") | .id' | head -1)
+          if [ -z "$art_id" ]; then echo "::error::no github-pages artifact"; exit 1; fi
+          echo "Artifact id: $art_id"
+
+          # Create the deployment. This is the exact body deploy-pages sends.
+          resp=$(curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$repo/pages/deployments" \
+            -d "{\"artifact_id\": $art_id, \"pages_build_version\": \"$sha\", \"oidc_token\": \"$tok\"}")
+          echo "Deployment response: $resp"
+          # The id when the response carries one (numeric, or a status_url whose last
+          # path segment is it). Observed on this repo it carries neither, and the
+          # status endpoint keys by the build SHA — actions/deploy-pages itself falls
+          # back to exactly that, so a missing id is normal, not an error.
+          dep_id=$(echo "$resp" | jq -r '
+            if .id then .id
+            elif .status_url then (.status_url | split("/") | last)
+            else empty end')
+          [ -n "$dep_id" ] || dep_id="$sha"
+          page_url=$(echo "$resp" | jq -r '.page_url // empty')
+          echo "page_url=$page_url" >> "$GITHUB_OUTPUT"
+
+          # Poll the status endpoint — up to 40 minutes, no cancel. actions/deploy-pages
+          # clamps its timeout input to 10 minutes (MAX_TIMEOUT in its source) and then
+          # CANCELS the deployment server-side, killing a sync that might still finish;
+          # this site is 37.6 MB compressed (~92 MB unpacked, the wasm alone is ~90 MB)
+          # and its sync legitimately outlasts 10 minutes, so this step deploys with the
+          # same API calls but polls longer and only ever reads status.
+          #
+          # Status taxonomy (from actions/deploy-pages' own temporaryErrorStatus /
+          # finalErrorStatus maps): not_found and deployment_attempt_error are TRANSIENT
+          # — the former is a race right after create, the latter retries server-side —
+          # so they stay in the poll loop. A transient curl failure is the same: log it
+          # and keep polling; the deadline is the only thing that ends the loop.
+          deadline=$(( $(date +%s) + 40*60 ))
+          errors=0
+          while :; do
+            sleep 20
+            if ! st=$(curl -sS --max-time 30 -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$repo/pages/deployments/$dep_id" \
+              | jq -r '.status // empty'); then
+              errors=$((errors + 1))
+              echo "::warning::status request failed ($errors in a row) — retrying"
+              if [ "$errors" -ge 10 ]; then
+                echo "::error::status endpoint unreachable 10 times in a row"; exit 1
+              fi
+            else
+              errors=0
+              echo "status: $st ($(date -u +%H:%M:%S))"
+              case "$st" in
+                succeed) echo "Deployed to $page_url"; exit 0 ;;
+                deployment_failed|deployment_content_failed|deployment_cancelled|deployment_lost)
+                  echo "::error::Pages deployment failed with status: $st"; exit 1 ;;
+                ""|not_found|deployment_attempt_error|deployment_queued|deploying|syncing_files)
+                  ;; # transient / in-flight: keep polling
+                *)
+                  echo "::warning::unrecognized status '$st' — keep polling";;
+              esac
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              # Do NOT cancel: leave the sync running; it may still finish server-side.
+              echo "::error::Status still '$st' after 40 minutes — leaving the sync running (no cancel), failing the job so the retry isn't blocked."
+              exit 1
+            fi
+          done
