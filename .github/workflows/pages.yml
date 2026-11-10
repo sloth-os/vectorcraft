@@ -136,9 +136,19 @@ jobs:
           repo="${GITHUB_REPOSITORY}"
           sha="${GITHUB_SHA}"
 
-          # The OIDC token the deploy API needs; requested for the default audience.
+          # The OIDC token the deploy API needs. The runner exposes the request
+          # endpoint + its bearer token as ACTIONS_ID_TOKEN_REQUEST_URL /
+          # ACTIONS_ID_TOKEN_REQUEST_TOKEN (this is exactly what core.getIDToken()
+          # reads inside actions/deploy-pages; no audience parameter there either).
+          # ACTIONS_RUNTIME_TOKEN is a different, artifact-upload credential and is
+          # not exported to steps. Guard first: set -u would otherwise die with an
+          # unbound-variable error that names nothing actionable.
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::runner did not expose the OIDC request env vars"; exit 1
+          fi
           echo "Requesting OIDC token…"
-          tok=$(curl -sS --fail-with-body -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+          tok=$(curl -sS --fail-with-body \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             -H "Accept: application/json; api-version=2.0" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r '.value')
           if [ -z "$tok" ] || [ "$tok" = "null" ]; then
