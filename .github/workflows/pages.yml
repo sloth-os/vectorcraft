@@ -97,10 +97,14 @@ jobs:
           set -euo pipefail
           # Move the dist out of the app tree, so it's obvious the workflow publishes
           # exactly what the build made, and drop the 1024px icon master in for the
-          # manifest icons (the site itself ships only 32 and 256px).
+          # manifest icons (the site itself ships only 32 and 256px). pwa.mjs resizes
+          # from it with this repo's own PNG codec (Node stdlib) and removes it again:
+          # it's build input, not site content, and must not be precached.
           rm -rf "$RUNNER_TEMP/dist"
           mv app/dist/web "$RUNNER_TEMP/dist"
           cp app/assets/app-icon/vectorcraft-1024.png "$RUNNER_TEMP/dist/icons/vectorcraft-1024.png"
+          # Build residue, not content: Trunk's lock marker.
+          rm -f "$RUNNER_TEMP/dist/.trunk-lock"
           node scripts/pwa.mjs "$RUNNER_TEMP/dist"
           # The dist is rebuilt weekly, but files keep the same name only when their
           # content changed. Print the site inventory for the build log.

@@ -13,19 +13,21 @@
 //   icons/favicon-96.png
 // and injects <link rel="manifest">, a description meta and the SW registration
 // into index.html. The workflow first copies the 1024px icon in as
-// icons/vectorcraft-1024.png.
+// icons/vectorcraft-1024.png (removed again after resizing — build input, not content).
 //
 // The dist's hashed file names (Trunk's filehash) are content addresses, so precaching
 // everything is safe: a weekly rebuild changes only the files whose content changed, and
 // the service worker deletes the old cache on activate.
 //
 // The app itself (wasm-bindgen glue) registers no worker; the inline script this writes
-// is the only registration. No npm dependencies: Node's stdlib only.
+// is the only registration. No npm dependencies: Node's stdlib only — including the icon
+// resize (png.mjs), so nothing depends on what the CI image happens to ship.
 
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from "node:fs";
-import { join, relative, basename, sep } from "node:path";
+import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync } from "node:fs";
+import { join, relative, sep } from "node:path";
 import { spawnSync } from "node:child_process";
+import { decodePng, resizeRgba, encodePng } from "./png.mjs";
 
 const dist = process.argv[2];
 if (!dist) {
@@ -43,10 +45,32 @@ const APP = {
 //
 // The 1024px RGBA master (assets/app-icon/vectorcraft-1024.png in the app repo, copied
 // into the dist by the workflow as icons/vectorcraft-1024.png) resized to the sizes the
-// manifest and iOS list. Pillow keeps the alpha channel; ImageMagick is the fallback.
-// One of the two is on every GitHub runner image.
+// manifest and iOS list.
+//
+// The resize runs through this repo's own PNG codec (png.mjs: decode → area-average →
+// encode, Node stdlib only). GitHub's ubuntu-latest image ships neither Pillow nor
+// ImageMagick — the first deploy failed on exactly that — so external tools are only a
+// fallback for inputs the codec rejects (sub-8-bit/16-bit depth, Adam7 interlace).
+
+let iconSourcePixels = null; // decoded master, shared by every resize
+let iconSourcePath = null;
+function decodeIconSource(path) {
+  if (iconSourcePixels && iconSourcePath === path) return iconSourcePixels;
+  const { width, height, rgba } = decodePng(readFileSync(path));
+  iconSourcePixels = { width, height, rgba };
+  iconSourcePath = path;
+  return iconSourcePixels;
+}
 
 function resize(input, size, output) {
+  try {
+    const src = decodeIconSource(input);
+    const rgba = resizeRgba(src.rgba, src.width, src.height, size, size);
+    writeFileSync(output, encodePng(rgba, size, size));
+    return;
+  } catch (err) {
+    console.warn(`pwa.mjs: Node PNG codec can't resize ${input} (${err.message}); trying Pillow/ImageMagick`);
+  }
   const py = spawnSync(
     "python3",
     [
@@ -58,7 +82,7 @@ function resize(input, size, output) {
   if (py.status === 0) return;
   const magick = spawnSync("magick", [input, "-resize", `${size}x${size}`, output], { stdio: "inherit" });
   if (magick.status === 0) return;
-  console.error(`error: could not resize ${input} with Pillow or ImageMagick`);
+  console.error(`error: could not resize ${input} with the Node codec, Pillow or ImageMagick`);
   process.exit(1);
 }
 
@@ -105,6 +129,17 @@ for (const [size, name] of [
   [96, "favicon-96.png"],
 ]) {
   resize(rasterSource, size, join(dist, "icons", name));
+}
+
+// Build input, not site content: the 1024px master the workflow copies in and the
+// SVG-rasterization scratch file are referenced by nothing on the page, so they must not
+// ship — and above all not be precached, which would put ~350 KB of dead weight into
+// every visitor's cache. Only these two exact paths are removed: an icon passed as
+// argv[2] may be the caller's own file outside the dist, never ours to delete.
+for (const scratch of [join(dist, "icons", "vectorcraft-1024.png"), join(dist, "icons", ".icon-raster-1024.png")]) {
+  try {
+    rmSync(scratch);
+  } catch {}
 }
 
 // ---- manifest ------------------------------------------------------------
@@ -164,12 +199,16 @@ const files = walk(dist)
   .filter((p) => p !== swName) // the worker never precaches itself
   .sort();
 
-// Trunk's filehash puts a 16+ hex digest in the wasm/glue/font file names; they need no
-// extra revision. Everything else is revisioned by content hash.
-const hashedName = (name) => /-([0-9a-f]{16,})\.(wasm|js|css|png|ttf|otf|woff2?)$/i.test(name);
+// Trunk's filehash content-addresses three ways, all covered here: a digest in the file
+// name before the extension (…-<hash>.js), before a _bg suffix (…-<hash>_bg.wasm — the
+// wasm-bindgen glue name), or as a directory component (fonts/<sha16>/…,
+// snippets/eframe-<hash>/…). Such files need no extra revision: the name already changes
+// when the content does. Everything else is revisioned by content hash.
+const HEX16 = /(?:^|[^0-9a-f])[0-9a-f]{16,}(?:[^0-9a-f]|$)/i;
+const hashedName = (rel) => rel.split("/").some((c) => HEX16.test(c));
 
 const precache = files.map((p) => {
-  if (hashedName(basename(p))) return { url: p };
+  if (hashedName(p)) return { url: p };
   return { url: p, revision: sha256(join(dist, p)).slice(0, 16) };
 });
 

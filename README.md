@@ -15,19 +15,19 @@ A single workflow, [`.github/workflows/pages.yml`](.github/workflows/pages.yml):
    WebAssembly SIMD enabled, the same way the upstream release pipeline does.
 3. Adds PWA support with [`scripts/pwa.mjs`](scripts/pwa.mjs): a web app manifest,
    resized icons, and a service worker that **pre-caches every file in the dist** —
-   the wasm (about 90 MB, ~30 MB compressed over the wire), the JS glue, the fonts —
+   the wasm (~90 MB uncompressed, ~30 MB over the wire), the JS glue, the fonts —
    so the app starts with no network at all once first loaded.
 4. Deploys the dist to GitHub Pages.
 
 The app's file names are content-hashed (Trunk's `filehash`), so the weekly rebuild only
 changes the URLs of files whose content changed; the service worker downloads those and
-deletes the old cache on activate. An update costs the difference, not 13 MB — except
-when the wasm itself changes, which is most weeks.
+deletes the old cache on activate. An update costs the difference, not the whole site —
+except when the wasm itself changes, which is most weeks.
 
 ## Offline behavior
 
-- First visit: everything is downloaded and precached (wasm + fonts, ~18 MB). The
-  service worker installs while the app already runs.
+- First visit: everything is downloaded and precached — roughly 30 MB compressed
+  (the wasm is most of it). The service worker installs while the app already runs.
 - Later visits, offline: the app starts from the cache. Documents are stored in
   `localStorage` by the app itself; fonts, the manifest and icons come from the precache.
 - The renderer flags the app documents (`?webgl`, `?cpu`) work offline too — navigations
@@ -69,8 +69,9 @@ python3 -m http.server 8765 --directory ../vectorcraft/dist/web
 #   Offline (reload with network off — the app still starts)
 ```
 
-The build needs `trunk`, the `wasm32-unknown-unknown` rustup target, and (for the icons)
-Python Pillow or ImageMagick.
+The build needs `trunk` and the `wasm32-unknown-unknown` rustup target. Nothing else: the
+icon resize is this repo's own code (`scripts/png.mjs`, Node stdlib only — the GitHub
+runner image ships neither Pillow nor ImageMagick, so it can't depend on them).
 
 ## Why a separate repo
 
